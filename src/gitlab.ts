@@ -1,3 +1,5 @@
+import { ParsedHunk } from './utils.js';
+
 /**
  * Shared types for GitLab integration
  */
@@ -49,21 +51,6 @@ export interface ReviewFeedback {
   isIgnored?: boolean;
   isNewlyAdded?: boolean;
   submissionError?: string;
-}
-
-export interface ParsedHunk {
-  header: string;
-  oldStartLine: number;
-  oldLineCount: number;
-  newStartLine: number;
-  newLineCount: number;
-  lines: Array<{
-    type: 'add' | 'remove' | 'context';
-    oldLine?: number;
-    newLine?: number;
-    content: string;
-  }>;
-  isCollapsed: boolean;
 }
 
 export interface ParsedFileDiff {
@@ -124,6 +111,13 @@ export interface GitLabProject {
   name_with_namespace: string;
   path_with_namespace: string;
   last_activity_at: string;
+  ssh_url_to_repo?: string;
+  http_url_to_repo?: string;
+  web_url?: string;
+  readme_url?: string;
+  issue_branch_template?: string;
+  statistics?: any;
+  _links?: any;
 }
 
 export interface GitLabMergeRequest {
@@ -158,27 +152,32 @@ export interface GitLabUser {
 }
 
 export function parseGitLabMergeRequestUrl(url: string): {
-  projectId: number;
+  projectPath: string;
   mrIid: number;
 } {
-  const match = url.match(
-    /\/(?<projectId>[^/]+)\/(?:-\/)?merge_requests\/(?<mrIid>\d+)$/,
-  );
-  if (!match || !match.groups) {
-    throw new Error(`Invalid GitLab Merge Request URL: ${url}`);
+  try {
+    const parsedUrl = new URL(url);
+    // Example: https://gitlab.com/group/subgroup/project/-/merge_requests/123
+    // Pathname: /group/subgroup/project/-/merge_requests/123
+    const pathParts = parsedUrl.pathname.split('/');
+    // Find the index of '-/merge_requests'
+    const mrIndex = pathParts.indexOf('-') + 1; // Should be index of 'merge_requests'
+    if (mrIndex === -1 || pathParts[mrIndex] !== 'merge_requests') {
+      throw new Error('Invalid GitLab MR URL format: merge_requests segment not found');
+    }
+
+    // Project path is everything before '-/merge_requests' joined by '/'
+    const projectPath = pathParts.slice(1, mrIndex - 1).join('/');
+    const mrIid = parseInt(pathParts[mrIndex + 1], 10);
+
+    if (isNaN(mrIid)) {
+      throw new Error(`Could not parse MR IID from URL: ${url}`);
+    }
+
+    return { projectPath, mrIid };
+  } catch (error) {
+    throw new Error(
+      `Failed to parse GitLab MR URL: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-
-  // For self-managed instances, the projectId can be a path (e.g., group/subgroup/project)
-  // We need to convert this path to a project ID. This will be handled by the gitlabOnPremMcp.ts
-  // For now, we'll just return the path as projectId and the mrIid.
-  // The actual project ID resolution will happen in gitlabOnPremMcp.ts
-  const projectId = match.groups.projectId;
-  const mrIid = parseInt(match.groups.mrIid, 10);
-
-  if (isNaN(mrIid)) {
-    throw new Error(`Could not parse MR IID from URL: ${url}`);
-  }
-
-  // Return projectId as string for now, it will be resolved to number in gitlabOnPremMcp.ts
-  return { projectId: projectId as any, mrIid };
 }

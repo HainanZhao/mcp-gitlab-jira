@@ -1,152 +1,27 @@
-import fetch from 'node-fetch';
+import { Gitlab } from '@gitbeaker/node';
 import {
   GitLabConfig,
   GitLabMRDetails,
   GitLabProject,
   GitLabMergeRequest,
   GitLabPosition,
-  GitLabUser,
-  ParsedHunk,
+  parseGitLabMergeRequestUrl,
 } from './gitlab.js';
+import { parseDiff, ParsedHunk } from './utils.js';
 
 export class GitLabService {
   private readonly config: GitLabConfig;
+  private readonly api: InstanceType<typeof Gitlab>;
   private projectCache: { data: GitLabProject[]; timestamp: number } | null =
     null;
   private readonly CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
   constructor(config: GitLabConfig) {
     this.config = config;
-  }
-
-  private async callGitLabApi<T>(
-    endpoint: string,
-    method: string = 'GET',
-    body?: object,
-  ): Promise<T> {
-    const url = `${this.config.url}/api/v4/${endpoint}`;
-    const headers = {
-      'Private-Token': this.config.accessToken,
-      'Content-Type': 'application/json',
-    };
-
-    const options: any = {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    };
-
-    try {
-      const response = await fetch(url, options);
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`GitLab API Error: ${response.status} - ${errorText}`);
-        throw new Error(`GitLab API Error: ${response.status} - ${errorText}`);
-      }
-      return response.json() as Promise<T>;
-    } catch (error) {
-      console.error(`Failed to call GitLab API: ${error}`);
-      throw error;
-    }
-  }
-
-  private parseDiff(diff: string): ParsedHunk[] {
-    const hunks: ParsedHunk[] = [];
-    const lines = diff.split('\n');
-    let currentHunk: ParsedHunk | null = null;
-
-    for (const line of lines) {
-      if (line.startsWith('@@')) {
-        // Hunk header
-        const headerMatch = line.match(
-          /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)/,
-        );
-        if (headerMatch) {
-          if (currentHunk) {
-            hunks.push(currentHunk);
-          }
-          currentHunk = {
-            header: line,
-            oldStartLine: parseInt(headerMatch[1], 10),
-            oldLineCount: parseInt(headerMatch[2] || '1', 10),
-            newStartLine: parseInt(headerMatch[3], 10),
-            newLineCount: parseInt(headerMatch[4] || '1', 10),
-            lines: [],
-            isCollapsed: false,
-          };
-        }
-      } else if (currentHunk) {
-        // Hunk content
-        let lineType: 'add' | 'remove' | 'context';
-        let oldLine: number | undefined;
-        let newLine: number | undefined;
-
-        if (line.startsWith('+')) {
-          lineType = 'add';
-          newLine =
-            currentHunk.newStartLine +
-            currentHunk.lines.filter((l) => l.type !== 'remove').length;
-        } else if (line.startsWith('-')) {
-          lineType = 'remove';
-          oldLine =
-            currentHunk.oldStartLine +
-            currentHunk.lines.filter((l) => l.type !== 'add').length;
-        } else {
-          lineType = 'context';
-          oldLine =
-            currentHunk.oldStartLine +
-            currentHunk.lines.filter((l) => l.type !== 'add').length;
-          newLine =
-            currentHunk.newStartLine +
-            currentHunk.lines.filter((l) => l.type !== 'remove').length;
-        }
-
-        currentHunk.lines.push({
-          type: lineType,
-          oldLine,
-          newLine,
-          content: line,
-        });
-      }
-    }
-
-    if (currentHunk) {
-      hunks.push(currentHunk);
-    }
-    return hunks;
-  }
-
-  // Utility method to parse GitLab MR URLs
-  private parseMrUrl(
-    mrUrl: string,
-    gitlabBaseUrl: string,
-  ): { projectPath: string; mrIid: number } {
-    try {
-      const url = new URL(mrUrl);
-      const baseUrl = new URL(gitlabBaseUrl);
-
-      // Ensure the URL is from the same GitLab instance
-      if (url.origin !== baseUrl.origin) {
-        throw new Error(
-          `MR URL is not from the configured GitLab instance: ${gitlabBaseUrl}`,
-        );
-      }
-
-      // Parse the path: /{namespace}/{project}/-/merge_requests/{iid}
-      const pathMatch = url.pathname.match(/^\/(.+)\/-\/merge_requests\/(\d+)/);
-      if (!pathMatch) {
-        throw new Error(`Invalid GitLab MR URL format: ${mrUrl}`);
-      }
-
-      const projectPath = pathMatch[1];
-      const mrIid = parseInt(pathMatch[2], 10);
-
-      return { projectPath, mrIid };
-    } catch (error) {
-      throw new Error(
-        `Failed to parse GitLab MR URL: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    this.api = new Gitlab({
+      host: this.config.url,
+      token: this.config.accessToken,
+    });
   }
 
   // Phase 2: Basic Features Implementation will go here
@@ -155,16 +30,15 @@ export class GitLabService {
     projectPath: string,
     mrIid: number,
   ): Promise<GitLabMRDetails> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    const baseUrl = `projects/${encodedProjectPath}/merge_requests/${mrIid}`;
+    const project = await this.api.Projects.show(projectPath);
+    const mrDetails = await this.api.MergeRequests.show(project.id, mrIid);
+    const mrChanges = await this.api.MergeRequests.changes(project.id, mrIid);
 
-    const mrDetails = await this.callGitLabApi<any>(baseUrl);
-    const mrChanges = await this.callGitLabApi<any>(
-      `projects/${encodedProjectPath}/merge_requests/${mrIid}/changes`,
-    );
-
+    // Safely handle changes with null check
+    const changes = mrChanges.changes || [];
+    
     // Map file diffs
-    const fileDiffs = mrChanges.changes.map((change: any) => ({
+    const fileDiffs = changes.map((change: any) => ({
       old_path: change.old_path,
       new_path: change.new_path,
       new_file: change.new_file,
@@ -179,21 +53,26 @@ export class GitLabService {
       isNew: diff.new_file,
       isDeleted: diff.deleted_file,
       isRenamed: diff.renamed_file,
-      hunks: this.parseDiff(diff.diff),
+      hunks: parseDiff(diff.diff),
     }));
 
+    // Type assertions for GitBeaker response
+    const mrData = mrDetails as any;
+    const diffRefs = mrData.diff_refs as any;
+    const author = mrData.author as any;
+
     return {
-      projectPath: mrDetails.path_with_namespace,
-      mrIid: mrDetails.iid.toString(),
-      projectId: mrDetails.project_id,
-      title: mrDetails.title,
-      authorName: mrDetails.author.name,
-      webUrl: mrDetails.web_url,
-      sourceBranch: mrDetails.source_branch,
-      targetBranch: mrDetails.target_branch,
-      base_sha: mrDetails.diff_refs.base_sha,
-      start_sha: mrDetails.diff_refs.start_sha,
-      head_sha: mrDetails.diff_refs.head_sha,
+      projectPath: mrData.path_with_namespace as string,
+      mrIid: mrData.iid.toString(),
+      projectId: mrData.project_id as number,
+      title: mrData.title as string,
+      authorName: author.name as string,
+      webUrl: mrData.web_url as string,
+      sourceBranch: mrData.source_branch as string,
+      targetBranch: mrData.target_branch as string,
+      base_sha: diffRefs.base_sha as string,
+      start_sha: diffRefs.start_sha as string,
+      head_sha: diffRefs.head_sha as string,
       fileDiffs: fileDiffs,
       diffForPrompt: fileDiffs.map((diff: any) => diff.diff).join('\n'),
       parsedDiffs: parsedDiffs,
@@ -205,7 +84,7 @@ export class GitLabService {
 
   // Convenience method to get MR details from URL
   async getMergeRequestDetailsFromUrl(mrUrl: string): Promise<GitLabMRDetails> {
-    const { projectPath, mrIid } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath, mrIid } = parseGitLabMergeRequestUrl(mrUrl);
     return this.getMergeRequestDetails(projectPath, mrIid);
   }
 
@@ -214,9 +93,10 @@ export class GitLabService {
     projectPath: string,
     mrIid: number,
   ): Promise<any[]> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    const mrDiscussions = await this.callGitLabApi<any>(
-      `projects/${encodedProjectPath}/merge_requests/${mrIid}/discussions`,
+    const project = await this.api.Projects.show(projectPath);
+    const mrDiscussions = await this.api.MergeRequestDiscussions.all(
+      project.id,
+      mrIid,
     );
 
     // Map discussions
@@ -250,7 +130,7 @@ export class GitLabService {
 
   // Convenience method to get MR discussions from URL
   async getMergeRequestDiscussionsFromUrl(mrUrl: string): Promise<any[]> {
-    const { projectPath, mrIid } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath, mrIid } = parseGitLabMergeRequestUrl(mrUrl);
     return this.getMergeRequestDiscussions(projectPath, mrIid);
   }
 
@@ -260,12 +140,13 @@ export class GitLabService {
     filePath: string,
     sha: string,
   ): Promise<string> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    const encodedFilePath = encodeURIComponent(filePath);
-    const content = await this.callGitLabApi<any>(
-      `projects/${encodedProjectPath}/repository/files/${encodedFilePath}/raw?ref=${sha}`,
+    const project = await this.api.Projects.show(projectPath);
+    const content = await this.api.RepositoryFiles.showRaw(
+      project.id,
+      filePath,
+      { ref: sha },
     );
-    return content;
+    return content as string;
   }
 
   // Convenience method to get file content from MR URL and file path/SHA
@@ -274,7 +155,7 @@ export class GitLabService {
     filePath: string,
     sha: string,
   ): Promise<string> {
-    const { projectPath } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath } = parseGitLabMergeRequestUrl(mrUrl);
     return this.getFileContent(projectPath, filePath, sha);
   }
 
@@ -286,43 +167,35 @@ export class GitLabService {
     commentBody: string,
     position: GitLabPosition | undefined,
   ): Promise<any> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
+    const project = await this.api.Projects.show(projectPath);
 
     if (discussionId) {
-      // Reply to an existing discussion
-      return this.callGitLabApi(
-        `projects/${encodedProjectPath}/merge_requests/${mrIid}/discussions/${discussionId}/notes`,
-        'POST',
-        { body: commentBody },
+      // Reply to an existing discussion - use Notes.create for adding to existing discussion
+      return this.api.MergeRequestNotes.create(
+        project.id,
+        mrIid,
+        commentBody,
+        {
+          discussion_id: discussionId,
+        },
       );
     } else if (position) {
       // Add a new comment with a position (inline comment)
-      return this.callGitLabApi(
-        `projects/${encodedProjectPath}/merge_requests/${mrIid}/notes`,
-        'POST',
-        {
-          body: commentBody,
-          noteable_type: 'MergeRequest',
-          noteable_id: mrIid,
-          position: {
-            base_sha: position.base_sha,
-            start_sha: position.start_sha,
-            head_sha: position.head_sha,
-            position_type: position.position_type,
-            old_path: position.old_path,
-            new_path: position.new_path,
-            new_line: position.new_line,
-            old_line: position.old_line,
-          },
+      return this.api.MergeRequestNotes.create(project.id, mrIid, commentBody, {
+        position: {
+          base_sha: position.base_sha,
+          start_sha: position.start_sha,
+          head_sha: position.head_sha,
+          position_type: position.position_type,
+          old_path: position.old_path,
+          new_path: position.new_path,
+          new_line: position.new_line,
+          old_line: position.old_line,
         },
-      );
+      });
     } else {
       // Add a general comment
-      return this.callGitLabApi(
-        `projects/${encodedProjectPath}/merge_requests/${mrIid}/notes`,
-        'POST',
-        { body: commentBody },
-      );
+      return this.api.MergeRequestNotes.create(project.id, mrIid, commentBody);
     }
   }
 
@@ -333,7 +206,7 @@ export class GitLabService {
     discussionId?: string,
     position?: GitLabPosition,
   ): Promise<any> {
-    const { projectPath, mrIid } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath, mrIid } = parseGitLabMergeRequestUrl(mrUrl);
     return this.addCommentToMergeRequest(
       projectPath,
       mrIid,
@@ -352,8 +225,13 @@ export class GitLabService {
       return this.projectCache.data;
     }
 
-    const url = `projects?membership=true&min_access_level=30&order_by=last_activity_at&sort=desc&per_page=100`;
-    const projects = await this.callGitLabApi<any[]>(url);
+    const projects = await this.api.Projects.all({
+      membership: true,
+      min_access_level: 30,
+      order_by: 'last_activity_at',
+      sort: 'desc',
+      perPage: 100,
+    });
 
     const simplifiedProjects: GitLabProject[] = projects.map((project) => ({
       id: project.id,
@@ -361,13 +239,6 @@ export class GitLabService {
       name_with_namespace: project.name_with_namespace,
       path_with_namespace: project.path_with_namespace,
       last_activity_at: project.last_activity_at,
-      ssh_url_to_repo: project.ssh_url_to_repo,
-      http_url_to_repo: project.http_url_to_repo,
-      web_url: project.web_url,
-      readme_url: project.readme_url,
-      issue_branch_template: project.issue_branch_template,
-      statistics: project.statistics,
-      _links: project._links,
     }));
 
     this.projectCache = { data: simplifiedProjects, timestamp: Date.now() };
@@ -376,10 +247,22 @@ export class GitLabService {
 
   // 4. List Merge Requests for a Project
   async listMergeRequests(projectPath: string): Promise<GitLabMergeRequest[]> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    return this.callGitLabApi<GitLabMergeRequest[]>(
-      `projects/${encodedProjectPath}/merge_requests`,
-    );
+    const project = await this.api.Projects.show(projectPath);
+    const mrs = await this.api.MergeRequests.all({ projectId: project.id });
+    
+    // Map to our interface
+    return mrs.map((mr: any) => ({
+      id: mr.id,
+      iid: mr.iid,
+      title: mr.title,
+      author: {
+        name: mr.author.name,
+        username: mr.author.username,
+      },
+      updated_at: mr.updated_at,
+      web_url: mr.web_url,
+      project_name: mr.project_id,
+    }));
   }
 
   // New tool: Assign Reviewers to Merge Request
@@ -388,12 +271,10 @@ export class GitLabService {
     mrIid: number,
     reviewerIds: number[],
   ): Promise<any> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    return this.callGitLabApi(
-      `projects/${encodedProjectPath}/merge_requests/${mrIid}`,
-      'PUT',
-      { reviewer_ids: reviewerIds },
-    );
+    const project = await this.api.Projects.show(projectPath);
+    return this.api.MergeRequests.edit(project.id, mrIid, {
+      reviewer_ids: reviewerIds,
+    });
   }
 
   // Convenience method to assign reviewers from MR URL
@@ -401,21 +282,20 @@ export class GitLabService {
     mrUrl: string,
     reviewerIds: number[],
   ): Promise<any> {
-    const { projectPath, mrIid } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath, mrIid } = parseGitLabMergeRequestUrl(mrUrl);
     return this.assignReviewersToMergeRequest(projectPath, mrIid, reviewerIds);
   }
 
   // New tool: List Project Members (Contributors)
   async listProjectMembers(projectPath: string): Promise<any[]> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    return this.callGitLabApi<any[]>(
-      `projects/${encodedProjectPath}/members/all`,
-    );
+    const project = await this.api.Projects.show(projectPath);
+    return this.api.ProjectMembers.all(project.id);
   }
 
   // Convenience method to list project members from MR URL
+  // Convenience method to list project members from MR URL
   async listProjectMembersFromMrUrl(mrUrl: string): Promise<any[]> {
-    const { projectPath } = this.parseMrUrl(mrUrl, this.config.url);
+    const { projectPath } = parseGitLabMergeRequestUrl(mrUrl);
     return this.listProjectMembers(projectPath);
   }
 
@@ -445,8 +325,8 @@ export class GitLabService {
 
   // New tool: Get Releases for a Project
   async getReleases(projectPath: string): Promise<any[]> {
-    const encodedProjectPath = encodeURIComponent(projectPath);
-    return this.callGitLabApi<any[]>(`projects/${encodedProjectPath}/releases`);
+    const project = await this.api.Projects.show(projectPath);
+    return this.api.Releases.all(project.id);
   }
 
   // New tool: Filter Releases Since a Specific Version
@@ -471,31 +351,17 @@ export class GitLabService {
 
   // New tool: Get User ID by Username
   async getUserIdByUsername(username: string): Promise<number> {
-    // First try exact username match
-    const exactUsers = await this.callGitLabApi<GitLabUser[]>(
-      `users?username=${username}`,
-    );
-    if (exactUsers.length > 0) {
-      return exactUsers[0].id;
+    const users = await this.api.Users.all({
+      username,
+      perPage: 100,
+    });
+
+    if (users.length === 0) {
+      throw new Error(`User with username '${username}' not found.`);
     }
 
-    // Fallback: search all users and filter by partial username (case-insensitive)
-    const allUsers =
-      await this.callGitLabApi<GitLabUser[]>(`users?per_page=100`);
-    const lowerCaseUsername = username.toLowerCase();
-
-    const matchingUsers = allUsers.filter(
-      (user) =>
-        user.username.toLowerCase().includes(lowerCaseUsername) ||
-        user.name.toLowerCase().includes(lowerCaseUsername),
-    );
-
-    if (matchingUsers.length === 0) {
-      throw new Error(`User with username containing '${username}' not found.`);
-    }
-
-    if (matchingUsers.length > 1) {
-      const userList = matchingUsers
+    if (users.length > 1) {
+      const userList = users
         .map((user) => `${user.username} (${user.name})`)
         .join(', ');
       throw new Error(
@@ -503,16 +369,13 @@ export class GitLabService {
       );
     }
 
-    return matchingUsers[0].id;
+    return users[0].id;
   }
 
   // New tool: Get User Activities
   async getUserActivities(userId: number, sinceDate?: Date): Promise<any[]> {
-    let endpoint = `users/${userId}/events`;
-    if (sinceDate) {
-      // GitLab API expects ISO 8601 format for `after` parameter
-      endpoint += `?after=${sinceDate.toISOString().split('T')[0]}`;
-    }
-    return this.callGitLabApi<any[]>(endpoint);
+    return this.api.Users.events(userId, {
+      after: sinceDate ? sinceDate.toISOString().split('T')[0] : undefined,
+    });
   }
 }
