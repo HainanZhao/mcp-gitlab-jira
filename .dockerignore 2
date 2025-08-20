@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
+dist
+*.tgz
+.github
+jest.config.cjs
+eslint.config.js
+todo.md
+test-mcp-tools.js
+*.test.ts
+*.test.js

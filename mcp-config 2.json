@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gitlab-on-prem-mcp": {
+      "command": "node",
+      "args": ["/Users/hainan.zhao/projects/mcp-gitlab/dist/index.js"],
+      "env": {
+        "GITLAB_URL": "YOUR_GITLAB_URL_HERE",
+        "GITLAB_ACCESS_TOKEN": "YOUR_ACCESS_TOKEN_HERE"
+      }
+    }
+  }
+}

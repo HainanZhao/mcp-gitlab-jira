@@ -207,8 +207,8 @@ This runs a new container for each MCP session:
 ### Jira Tools
 
 #### Core Jira Tools
-- `jira_get_ticket_details`: Fetches detailed information about a Jira ticket.
-- `jira_get_ticket_comments`: Fetches comments for a Jira ticket.
+- `jira_get_jira_ticket_details`: Fetches detailed information about a Jira ticket.
+- `jira_get_jira_ticket_comments`: Fetches comments for a Jira ticket.
 - `jira_add_comment_to_ticket`: Adds a comment to a Jira ticket.
 - `jira_search_tickets_by_jql`: Searches for Jira tickets using a JQL (Jira Query Language) string.
 - `jira_create_ticket`: Creates a new Jira ticket with given fields.
